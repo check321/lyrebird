@@ -1,0 +1,129 @@
+@import "tailwindcss";
+
+/* 播放字幕渲染字体（libass 也使用同一文件，保证预览与播放一致） */
+@font-face {
+  font-family: "Roboto";
+  src: url("/fonts/Roboto-Regular.ttf");
+  font-weight: 400;
+}
+@font-face {
+  font-family: "Noto Sans CJK SC";
+  src: url("/fonts/NotoSansCJKsc-Regular.otf");
+  font-weight: 400;
+}
+@font-face {
+  font-family: "Merriweather";
+  src: url("/fonts/Merriweather.ttf");
+}
+@font-face {
+  font-family: "Nunito";
+  src: url("/fonts/Nunito.ttf");
+}
+@font-face {
+  font-family: "Caveat";
+  src: url("/fonts/Caveat.ttf");
+}
+
+:root {
+  color-scheme: light;
+}
+
+/* TLDR 等 markdown 渲染内容的基础排版 */
+.tldr p {
+  margin: 0.5em 0;
+}
+.tldr ul,
+.tldr ol {
+  margin: 0.5em 0;
+  padding-left: 1.25em;
+  list-style: disc;
+}
+.tldr ol {
+  list-style: decimal;
+}
+.tldr li {
+  margin: 0.25em 0;
+}
+.tldr strong {
+  font-weight: 600;
+  color: var(--color-zinc-800);
+}
+.tldr h1,
+.tldr h2,
+.tldr h3 {
+  font-weight: 600;
+  margin: 0.75em 0 0.25em;
+  color: var(--color-zinc-700);
+}
+
+/* MDX 词条富文本（不同词典的 HTML 结构差异大，做通用排版兜底） */
+.mdx-entry :is(h1, h2, h3, h4) {
+  font-weight: 600;
+  color: var(--color-zinc-800);
+  margin: 0.5em 0 0.25em;
+}
+.mdx-entry p {
+  margin: 0.4em 0;
+}
+.mdx-entry ul,
+.mdx-entry ol {
+  padding-left: 1.25em;
+  margin: 0.4em 0;
+  list-style: disc;
+}
+.mdx-entry ol {
+  list-style: decimal;
+}
+.mdx-entry a {
+  color: var(--color-indigo-600);
+}
+.mdx-entry img {
+  max-width: 100%;
+}
+.mdx-entry font[color],
+.mdx-entry .eg {
+  color: var(--color-zinc-500);
+}
+
+/* AI 处理中的"thinking"微光流动文字（类 ChatGPT thinking 效果） */
+@keyframes lyre-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+.thinking-text {
+  background: linear-gradient(
+    90deg,
+    var(--color-zinc-300) 25%,
+    var(--color-indigo-500) 50%,
+    var(--color-zinc-300) 75%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: lyre-shimmer 1.8s linear infinite;
+}
+@keyframes lyre-dots {
+  0%,
+  20% {
+    content: "";
+  }
+  40% {
+    content: ".";
+  }
+  60% {
+    content: "..";
+  }
+  80%,
+  100% {
+    content: "...";
+  }
+}
+.thinking-dots::after {
+  content: "";
+  animation: lyre-dots 1.5s steps(1) infinite;
+}
