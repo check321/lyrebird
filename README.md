@@ -79,4 +79,4 @@ static/fonts/       字幕字体（页面 @font-face 与 libass 共用）
 
 ## License
 
-MIT
+Apache-2.0（见 [LICENSE](LICENSE)）
