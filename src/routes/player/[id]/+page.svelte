@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke, convertFileSrc } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { page } from "$app/stores";
   import SubtitlesOctopus from "libass-wasm";
@@ -14,6 +14,7 @@
     type AssStyleOptions,
   } from "$lib/ass";
   import SubtitleStylePanel from "$lib/SubtitleStylePanel.svelte";
+  import ExportDialog from "$lib/ExportDialog.svelte";
   import { speakWord } from "$lib/speech";
   import ReadingPanel from "$lib/ReadingPanel.svelte";
   import { ui } from "$lib/ui.svelte";
@@ -80,6 +81,16 @@
     definition: string | null;
     ai_analysis: string | null;
   };
+  type Chapter = {
+    id: number;
+    video_id: number;
+    idx: number;
+    start_secs: number;
+    end_secs: number;
+    title: string;
+    summary: string | null;
+  };
+  type Storyboard = { interval: number; paths: string[] };
   type Popover = {
     word: string;
     x: number;
@@ -105,7 +116,7 @@
   let pipelineStatus = $state<string | null>(null);
   let translating = $state(false);
   let translateProgress = $state<{ done: number; total: number } | null>(null);
-  let tab = $state<"raw" | "refined" | "bilingual">("raw");
+  let tab = $state<"refined" | "bilingual" | "chapters">("refined");
   let popover = $state<Popover | null>(null);
   let hoverCard = $state<{
     word: string;
@@ -126,12 +137,21 @@
   let theater = $state(false);
   let prevSidebarCollapsed = false;
   let pausePanelHidden = $state(false);
+  let showExport = $state(false);
+  let chapters = $state<Chapter[]>([]);
+  let storyboard = $state<Storyboard | null>(null);
+  let chaptersGenerating = $state(false);
+  let hoverT = $state<number | null>(null);
+  let hoverX = $state(0);
+  let storyboardStarted = false;
 
   // 自定义播放控制条状态
   let playing = $state(false);
   let duration = $state(0);
   let volume = $state(1);
   let rate = $state(1);
+  let videoW = $state(0);
+  let videoH = $state(0);
 
   const id = Number($page.params.id);
 
@@ -156,18 +176,44 @@
       ?.id ?? -1,
   );
 
-  /** 原字幕 tab 的当前 cue id */
-  const currentCueId = $derived(
-    cues.find((c) => c.start_secs <= currentTime && currentTime < c.end_secs)
-      ?.id ?? -1,
-  );
-
   /** 句子级中文是否已生成 */
   const hasSentenceZh = $derived(sentences.some((s) => s.text_zh != null));
 
   const savedWordMap = $derived(
     new Map(savedWords.map((w) => [w.word.toLowerCase(), w])),
   );
+
+  /** 当前播放位置所在章节 */
+  const currentChapter = $derived(
+    chapters.find((c) => currentTime >= c.start_secs && currentTime < c.end_secs),
+  );
+  const currentChapterId = $derived(currentChapter?.id ?? -1);
+  const chapterStatus = $derived<"none" | "generating" | "ready">(
+    chaptersGenerating ? "generating" : chapters.length > 0 ? "ready" : "none",
+  );
+
+  /** 后台生成/读取时间轴缩略图（storyboard），静默失败仅影响悬停预览 */
+  function loadStoryboard() {
+    const dur = video?.duration_secs || duration;
+    if (storyboardStarted || !dur) return;
+    storyboardStarted = true;
+    invoke<Storyboard>("video_storyboard", { videoId: id, durationSecs: dur })
+      .then((s) => (storyboard = s))
+      .catch(() => {});
+  }
+
+  async function regenerateChapters() {
+    if (chaptersGenerating || sentences.length === 0) return;
+    chaptersGenerating = true;
+    try {
+      await invoke("generate_chapters", { videoId: id });
+      chapters = await invoke<Chapter[]>("list_chapters", { videoId: id });
+    } catch (e) {
+      actionError = String(e);
+    } finally {
+      chaptersGenerating = false;
+    }
+  }
 
   onMount(() => {
     const unlisteners: (() => void)[] = [];
@@ -176,10 +222,12 @@
       cues = await invoke<Cue[]>("list_cues", { videoId: id });
       sentences = await invoke<Sentence[]>("list_sentences", { videoId: id });
       savedWords = await invoke<SavedWord[]>("list_saved_words", { videoId: id });
+      chapters = await invoke<Chapter[]>("list_chapters", { videoId: id });
       // 已有整理精校结果时默认展示精校 tab
       if (sentences.length > 0) tab = "refined";
       if (video?.video_path) {
         videoSrc = await invoke<string>("media_url", { path: video.video_path });
+        loadStoryboard();
       }
       const settings = await invoke<Record<string, string>>("get_settings");
       assStyle = styleFromSettings(settings);
@@ -236,25 +284,49 @@
           await invoke("fill_sentence_zh", { videoId: id });
           sentences = await invoke<Sentence[]>("list_sentences", { videoId: id });
         }
-        if (video && !video.tldr) {
-          pipelineStatus = "TLDR 生成中…";
-          invoke<string>("generate_tldr", { videoId: id })
-            .then((t) => {
-              if (video) video = { ...video, tldr: t };
-            })
-            .catch(() => {})
-            .finally(() => (pipelineStatus = null));
+        // 后台依次补齐 TLDR / 章节概要（共享 pipelineStatus，串行避免闪烁）
+        const needTldr = video && !video.tldr;
+        const needChapters = sentences.length > 0 && chapters.length === 0;
+        if (needTldr || needChapters) {
+          (async () => {
+            if (needTldr) {
+              pipelineStatus = "TLDR 生成中…";
+              await invoke<string>("generate_tldr", { videoId: id })
+                .then((t) => {
+                  if (video) video = { ...video, tldr: t };
+                })
+                .catch(() => {});
+            }
+            if (needChapters) {
+              pipelineStatus = "章节概要生成中…";
+              chaptersGenerating = true;
+              await invoke("generate_chapters", { videoId: id })
+                .then(async () => {
+                  chapters = await invoke<Chapter[]>("list_chapters", {
+                    videoId: id,
+                  });
+                })
+                .catch(() => {});
+              chaptersGenerating = false;
+            }
+          })().finally(() => (pipelineStatus = null));
         }
       }
     })();
 
     const onKey = (e: KeyboardEvent) => {
-      // 空格 播放/暂停（输入控件聚焦时不抢）
+      // 空格 播放/暂停；←/→ 后退/快进 5s（输入控件聚焦时不抢）
+      const t = e.target as HTMLElement;
+      if (t.closest("input, textarea, [contenteditable='true']")) return;
       if (e.code === "Space") {
-        const t = e.target as HTMLElement;
-        if (t.closest("input, textarea, [contenteditable='true']")) return;
         e.preventDefault();
         togglePlay();
+      } else if (e.code === "ArrowLeft") {
+        e.preventDefault();
+        skipBy(-5);
+      } else if (e.code === "ArrowRight") {
+        e.preventDefault();
+        skipBy(5);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -395,6 +467,14 @@
       }
       await invoke("fill_sentence_zh", { videoId: id });
       sentences = await invoke<Sentence[]>("list_sentences", { videoId: id });
+      // 章节概要随翻译链路补齐（句子已就绪）
+      if (chapters.length === 0) {
+        pipelineStatus = "章节概要生成中…";
+        chaptersGenerating = true;
+        await invoke("generate_chapters", { videoId: id }).catch(() => {});
+        chapters = await invoke<Chapter[]>("list_chapters", { videoId: id });
+        chaptersGenerating = false;
+      }
     } catch (e) {
       actionError = String(e);
     } finally {
@@ -419,6 +499,12 @@
       await invoke("structure_video", { videoId: id, force: true });
       await invoke("fill_sentence_zh", { videoId: id });
       sentences = await invoke<Sentence[]>("list_sentences", { videoId: id });
+      // 段落变了章节也要重生成
+      pipelineStatus = "章节概要生成中…";
+      chaptersGenerating = true;
+      await invoke("generate_chapters", { videoId: id }).catch(() => {});
+      chapters = await invoke<Chapter[]>("list_chapters", { videoId: id });
+      chaptersGenerating = false;
       tab = "refined";
     } catch (e) {
       actionError = String(e);
@@ -448,6 +534,12 @@
 
   function seek(t: number) {
     if (videoEl) videoEl.currentTime = t;
+  }
+
+  /** 快进/后退 delta 秒：保持当前播放状态，钳制在 [0, duration] */
+  function skipBy(delta: number) {
+    if (videoEl)
+      seek(Math.min(Math.max(videoEl.currentTime + delta, 0), duration || 0));
   }
 
   function setVolume(v: number) {
@@ -505,6 +597,8 @@
   function onVideoMeta() {
     if (!videoEl) return;
     duration = videoEl.duration || 0;
+    videoW = videoEl.videoWidth || 0;
+    videoH = videoEl.videoHeight || 0;
     // ?t= 参数（生词卡跳转）优先，否则从上次断点续播
     const t = Number($page.url.searchParams.get("t"));
     if (t > 0) {
@@ -525,12 +619,30 @@
     }
   }
 
-  // 当前句/cue 变化时滚动到可视区域（按当前 tab 选目标）
+  /** 剪辑条拖动联动预览：只定位不强制播放 */
+  function scrubTo(secs: number) {
+    if (videoEl) {
+      videoEl.pause();
+      videoEl.currentTime = secs + 0.001;
+    }
+  }
+
+  /** 时间轴悬停：计算预览时间与预览框 x（clamp 防出屏） */
+  function onTimelineHover(e: MouseEvent) {
+    const el = e.currentTarget as HTMLElement;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || duration <= 0) return;
+    const x = Math.min(rect.width, Math.max(0, e.clientX - rect.left));
+    hoverT = (x / rect.width) * duration;
+    hoverX = Math.min(rect.width - 72, Math.max(72, x));
+  }
+
+  // 当前句/章节变化时滚动到可视区域（按当前 tab 选目标）
   $effect(() => {
-    if (tab === "raw") {
-      if (currentCueId >= 0) {
+    if (tab === "chapters") {
+      if (currentChapterId >= 0) {
         listEl
-          ?.querySelector(`[data-cue="${currentCueId}"]`)
+          ?.querySelector(`[data-chapter="${currentChapterId}"]`)
           ?.scrollIntoView({ block: "center", behavior: "smooth" });
       }
     } else if (currentSentId >= 0) {
@@ -564,7 +676,12 @@
     };
     try {
       const lookup = await invoke<RichLookup>("lookup_word", { word });
-      if (popover?.word === word) popover = { ...popover, lookup };
+      if (popover?.word === word) {
+        popover = { ...popover, lookup };
+        // 短语通常查不到词典，未命中时自动 AI 解析
+        if (word.includes(" ") && !lookup.mdx_html && !lookup.entry)
+          aiAnalyze();
+      }
     } catch (err) {
       if (popover?.word === word)
         popover = { ...popover, lookup: null, aiAnalysis: String(err) };
@@ -663,7 +780,7 @@
         startSecs: popover.startSecs,
       });
       savedWords = await invoke<SavedWord[]>("list_saved_words", { videoId: id });
-      popover = { ...popover, added: true };
+      popover = null; // 加入成功后自动关闭词典面板，高亮词即反馈
     } catch (e) {
       actionError = String(e);
     }
@@ -671,6 +788,18 @@
 
   function closePopover() {
     popover = null;
+  }
+
+  /** 人工修订句子文本：更新数据库与本地状态（内嵌字幕、阅读区高亮随 sentences 自动重建） */
+  async function editSentence(sentenceId: number, text: string) {
+    try {
+      await invoke("update_sentence", { id: sentenceId, textEn: text });
+      sentences = sentences.map((s) =>
+        s.id === sentenceId ? { ...s, text_en: text } : s,
+      );
+    } catch (e) {
+      actionError = String(e);
+    }
   }
 </script>
 
@@ -704,18 +833,32 @@
         <h2 class="min-w-0 truncate text-lg font-semibold text-zinc-800">
           {video.title ?? "未命名视频"}
         </h2>
-        <button
-          onclick={toggleTheater}
-          class="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"
-          title={theater ? "退出沉浸模式" : "沉浸模式（隐藏字幕栏和侧边栏）"}
-          aria-label="沉浸模式"
-        >
-          {#if theater}
-            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m14 10 7-7" /><path d="M20 10h-6V4" /><path d="m3 21 7-7" /><path d="M4 14h6v6" /></svg>
-          {:else}
-            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 21-6-6" /><path d="M21 15v6h-6" /><path d="m3 3 6 6" /><path d="M9 3v6H3" /></svg>
+        <div class="flex shrink-0 items-center gap-1">
+          {#if video.video_path && videoSrc}
+            <button
+              onclick={() => (showExport = !showExport)}
+              class="flex h-8 w-8 items-center justify-center rounded-md {showExport
+                ? 'bg-indigo-50 text-indigo-600'
+                : 'text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700'}"
+              title="导出剪辑（可烧录字幕）"
+              aria-label="导出剪辑"
+            >
+              <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3" /><path d="M8.12 8.12 12 12" /><path d="M20 4 8.12 15.88" /><circle cx="6" cy="18" r="3" /><path d="M14.8 14.8 20 20" /></svg>
+            </button>
           {/if}
-        </button>
+          <button
+            onclick={toggleTheater}
+            class="flex h-8 w-8 items-center justify-center rounded-md text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700"
+            title={theater ? "退出沉浸模式" : "沉浸模式（隐藏字幕栏和侧边栏）"}
+            aria-label="沉浸模式"
+          >
+            {#if theater}
+              <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m14 10 7-7" /><path d="M20 10h-6V4" /><path d="m3 21 7-7" /><path d="M4 14h6v6" /></svg>
+            {:else}
+              <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 21-6-6" /><path d="M21 15v6h-6" /><path d="m3 3 6 6" /><path d="M9 3v6H3" /></svg>
+            {/if}
+          </button>
+        </div>
       </div>
 
       {#if video.video_path && videoSrc}
@@ -743,22 +886,81 @@
         <div
           class="relative mt-2 rounded-lg border border-zinc-200 bg-white px-3 py-2 shadow-sm"
         >
-          <input
-            type="range"
-            min="0"
-            max={duration || 0}
-            step="0.1"
-            value={currentTime}
-            oninput={(e) => seek(Number((e.target as HTMLInputElement).value))}
-            class="h-1 w-full accent-indigo-600"
-            aria-label="播放进度"
-          />
+          <!-- 时间轴：滑杆 + 章节刻度 + 悬停预览（缩略图/时间/章节标题） -->
+          <div
+            class="relative"
+            onmousemove={onTimelineHover}
+            onmouseleave={() => (hoverT = null)}
+            role="presentation"
+          >
+            <input
+              type="range"
+              min="0"
+              max={duration || 0}
+              step="0.1"
+              value={currentTime}
+              oninput={(e) => seek(Number((e.target as HTMLInputElement).value))}
+              onchange={(e) => (e.target as HTMLInputElement).blur()}
+              class="h-1 w-full accent-indigo-600"
+              aria-label="播放进度"
+            />
+            {#each chapters as ch, i (ch.id)}
+              {#if i > 0 && duration > 0}
+                <div
+                  class="pointer-events-none absolute top-1/2 h-1.5 w-0.5 -translate-y-1/2 rounded-full bg-white shadow-[0_0_3px_rgba(0,0,0,0.6)]"
+                  style="left: {(ch.start_secs / duration) * 100}%"
+                ></div>
+              {/if}
+            {/each}
+            {#if hoverT != null && duration > 0}
+              {@const sbIdx = storyboard
+                ? Math.min(
+                    storyboard.paths.length - 1,
+                    Math.floor(hoverT / storyboard.interval),
+                  )
+                : -1}
+              {@const hch = chapters.find(
+                (c) => hoverT! >= c.start_secs && hoverT! < c.end_secs,
+              )}
+              <div
+                class="pointer-events-none absolute bottom-full z-30 mb-2 -translate-x-1/2 rounded-lg border border-zinc-200 bg-white p-1.5 shadow-lg"
+                style="left: {hoverX}px"
+              >
+                {#if sbIdx >= 0 && storyboard?.paths[sbIdx]}
+                  <img
+                    src={convertFileSrc(storyboard.paths[sbIdx])}
+                    alt=""
+                    class="h-18 w-32 rounded object-cover"
+                  />
+                {/if}
+                <div class="flex items-center gap-1.5 px-0.5 pt-1">
+                  <span class="shrink-0 font-mono text-[10px] text-zinc-500"
+                    >{fmtTime(hoverT)}</span
+                  >
+                  {#if hch}
+                    <span class="max-w-40 truncate text-xs font-medium text-zinc-700"
+                      >{hch.title}</span
+                    >
+                  {/if}
+                </div>
+              </div>
+            {/if}
+          </div>
 
           <div class="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1.5">
             <button
+              onclick={() => skipBy(-5)}
+              class="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-zinc-600 hover:bg-zinc-100"
+              title="后退 5 秒（←）"
+              aria-label="后退 5 秒"
+            >
+              <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path d="M3 3v5h5" /><text x="12" y="15.5" text-anchor="middle" font-size="8.5" font-weight="600" fill="currentColor" stroke="none">5</text></svg>
+            </button>
+
+            <button
               onclick={togglePlay}
               class="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-zinc-600 hover:bg-zinc-100"
-              title={playing ? "暂停" : "播放"}
+              title={playing ? "暂停（空格）" : "播放（空格）"}
               aria-label={playing ? "暂停" : "播放"}
             >
               {#if playing}
@@ -768,9 +970,25 @@
               {/if}
             </button>
 
+            <button
+              onclick={() => skipBy(5)}
+              class="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-zinc-600 hover:bg-zinc-100"
+              title="快进 5 秒（→）"
+              aria-label="快进 5 秒"
+            >
+              <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8" /><path d="M21 3v5h-5" /><text x="12" y="15.5" text-anchor="middle" font-size="8.5" font-weight="600" fill="currentColor" stroke="none">5</text></svg>
+            </button>
+
             <span class="shrink-0 font-mono text-xs text-zinc-500">
               {fmtTime(currentTime)} / {fmtTime(duration)}
             </span>
+
+            {#if currentChapter}
+              <span
+                class="max-w-48 truncate text-xs font-medium text-indigo-600"
+                title={currentChapter.title}>{currentChapter.title}</span
+              >
+            {/if}
 
             <div class="flex shrink-0 overflow-hidden rounded-md border border-zinc-200">
               {#each [0.75, 1, 1.25, 1.5, 2] as r (r)}
@@ -803,6 +1021,7 @@
                 step="0.05"
                 value={volume}
                 oninput={(e) => setVolume(Number((e.target as HTMLInputElement).value))}
+                onchange={(e) => (e.target as HTMLInputElement).blur()}
                 class="h-1 w-16 accent-indigo-600"
                 aria-label="音量大小"
               />
@@ -917,6 +1136,24 @@
         <p class="text-sm text-zinc-400">视频文件尚未就绪。</p>
       {/if}
 
+      {#if showExport && video.video_path && videoSrc}
+        <ExportDialog
+          videoId={id}
+          title={video.title}
+          {cues}
+          {sentences}
+          {assStyle}
+          {duration}
+          {currentTime}
+          {hasSentenceZh}
+          videoWidth={videoW}
+          videoHeight={videoH}
+          {storyboard}
+          onseek={scrubTo}
+          onclose={() => (showExport = false)}
+        />
+      {/if}
+
       {#if actionError}
         <p class="mt-3 rounded-md bg-red-50 px-3 py-2 text-sm text-red-600">
           {actionError}
@@ -984,20 +1221,24 @@
                 {cues}
                 {sentences}
                 {paragraphs}
-                {currentCueId}
                 {currentSentId}
                 {savedWordMap}
                 {pipelineStatus}
                 {translating}
                 {hasSentenceZh}
+                {chapters}
+                {currentChapterId}
+                {chapterStatus}
                 subtitleSource={video.subtitle_source}
                 onseek={seekTo}
                 onword={clickWord}
                 ontranslate={startTranslate}
                 onasr={startAsr}
                 onrestructure={restructure}
+                ongenerate={regenerateChapters}
                 onhover={(saved, e) => (saved ? showHover(saved, e!) : (hoverCard = null))}
                 onhide={() => (pausePanelHidden = true)}
+                oneditsentence={editSentence}
               />
             </div>
           </div>
@@ -1013,19 +1254,23 @@
           {cues}
           {sentences}
           {paragraphs}
-          {currentCueId}
           {currentSentId}
           {savedWordMap}
           {pipelineStatus}
           {translating}
           {hasSentenceZh}
+          {chapters}
+          {currentChapterId}
+          {chapterStatus}
           subtitleSource={video.subtitle_source}
           onseek={seekTo}
           onword={clickWord}
           ontranslate={startTranslate}
           onasr={startAsr}
           onrestructure={restructure}
+          ongenerate={regenerateChapters}
           onhover={(saved, e) => (saved ? showHover(saved, e!) : (hoverCard = null))}
+          oneditsentence={editSentence}
         />
       </div>
     {/if}
@@ -1063,6 +1308,9 @@
         <span class="text-base font-semibold text-zinc-800">
           {entry?.word ?? popover.word}
         </span>
+        {#if popover.word.includes(" ")}
+          <span class="rounded bg-indigo-50 px-1.5 py-0.5 text-[10px] font-medium text-indigo-600">短语</span>
+        {/if}
         {#if entry?.phonetic}
           <span class="text-xs text-zinc-400">/{entry.phonetic}/</span>
         {/if}

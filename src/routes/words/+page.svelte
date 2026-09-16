@@ -167,6 +167,9 @@
                 <div class="flex items-start justify-between gap-2">
                   <div class="min-w-0">
                     <span class="text-base font-bold text-zinc-900">{c.word}</span>
+                    {#if c.word.includes(" ")}
+                      <span class="ml-1.5 rounded bg-indigo-50 px-1.5 py-0.5 text-[10px] font-medium text-indigo-600">短语</span>
+                    {/if}
                     {#if c.phonetic}
                       <span class="ml-1.5 text-xs text-zinc-400">/{c.phonetic}/</span>
                     {/if}

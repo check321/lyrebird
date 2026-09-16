@@ -47,6 +47,28 @@ pub struct Sentence {
 }
 
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Chapter {
+    pub id: i64,
+    pub video_id: i64,
+    pub idx: i64,
+    pub start_secs: f64,
+    pub end_secs: f64,
+    pub title: String,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Subscription {
+    pub id: i64,
+    pub channel_id: String,
+    pub title: String,
+    pub url: String,
+    pub avatar: Option<String>,
+    pub follower_count: Option<i64>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
 pub struct WordCard {
     pub id: i64,
     pub word: String,

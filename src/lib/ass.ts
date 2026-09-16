@@ -137,6 +137,11 @@ const FONT_NAMES: Record<string, string> = {
   caveat: "Caveat",
 };
 
+/** 字体 key → 字体族名（导出烧录的 Canvas 渲染复用，与 @font-face 同名） */
+export function fontFamilyName(key: string): string {
+  return FONT_NAMES[key] ?? "Roboto";
+}
+
 export function styleFromSettings(s: Record<string, string>): AssStyleOptions {
   const d = DEFAULT_ASS_STYLE;
   return {
@@ -219,7 +224,7 @@ const MIN_CHUNK_SECS = 1.2;
 const LEADING_PUNCT = /^[，。！？；：、,.!?;:"'“”‘’（）()\[\]]+/;
 
 /** 把长句子切成词组事件（优先在标点处断开），中文按字符比例同步切分 */
-function chunkCue(c: AssCue): AssCue[] {
+export function chunkCue(c: AssCue): AssCue[] {
   const words = c.text_en.split(/\s+/).filter(Boolean);
   if (words.length <= MAX_WORDS_PER_CAPTION) return [c];
 

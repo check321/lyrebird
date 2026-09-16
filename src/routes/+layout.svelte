@@ -7,15 +7,15 @@
 
   let { children } = $props();
 
-  type VideoBrief = { id: number; title: string | null; url: string };
+  type VideoBrief = { id: number; title: string | null; url: string; video_path: string | null };
 
     let recent = $state<VideoBrief[]>([]);
 
-  // 每次路由变化都刷新侧边栏的媒体记录
+  // 每次路由变化都刷新侧边栏的媒体记录（下载中断的条目不出现在快捷列表）
   $effect(() => {
     $page.url.pathname;
     invoke<VideoBrief[]>("list_videos")
-      .then((v) => (recent = v.slice(0, 8)))
+      .then((v) => (recent = v.filter((x) => x.video_path != null).slice(0, 8)))
       .catch(() => {});
   });
 </script>
@@ -74,6 +74,7 @@
         class="rounded-md px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-100"
         >生词本</a
       >
+
       <a
         href="/settings"
         class="rounded-md px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-100"

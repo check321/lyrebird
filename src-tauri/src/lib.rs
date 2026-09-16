@@ -1,7 +1,9 @@
 mod asr;
+mod channel;
 mod commands;
 mod db;
 mod dict;
+mod export;
 mod ingest;
 mod llm;
 mod mdx;
@@ -13,7 +15,9 @@ mod translate;
 mod words;
 
 use asr::*;
+use channel::*;
 use commands::*;
+use export::*;
 use llm::*;
 use mdx::*;
 use media::*;
@@ -52,6 +56,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .manage(ExportState::default())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let media_dir = data_dir.join("media");
@@ -77,6 +82,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_videos,
             import_video,
+            fetch_channel,
+            subscribe_channel,
+            unsubscribe_channel,
+            list_subscriptions,
             get_video,
             list_cues,
             delete_video,
@@ -87,9 +96,12 @@ pub fn run() {
             test_llm_connection,
             translate_video,
             generate_tldr,
+            generate_chapters,
+            list_chapters,
             structure_video,
             fill_sentence_zh,
             list_sentences,
+            update_sentence,
             lookup_word,
             speak_word,
             import_mdx,
@@ -107,6 +119,12 @@ pub fn run() {
             review_stats,
             transcribe_video,
             check_asr_env,
+            export_video,
+            cancel_export,
+            ensure_export_fonts,
+            ffmpeg_features,
+            video_storyboard,
+            reveal_in_folder,
             media_url,
             save_position,
         ])

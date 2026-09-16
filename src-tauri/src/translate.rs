@@ -714,6 +714,205 @@ pub async fn list_sentences(
     .map_err(|e| e.to_string())
 }
 
+/// 人工修订句子英文文本（ASR/CC 字幕错误修正；不动 text_zh，重新整理会覆盖修订）
+#[tauri::command]
+pub async fn update_sentence(
+    pool: tauri::State<'_, SqlitePool>,
+    id: i64,
+    text_en: String,
+) -> Result<(), String> {
+    let text = text_en.trim();
+    if text.is_empty() {
+        return Err("句子内容不能为空".into());
+    }
+    sqlx::query("UPDATE sentences SET text_en = ? WHERE id = ?")
+        .bind(text)
+        .bind(id)
+        .execute(pool.inner())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ---------- AI 章节概要（整理精校后自动执行：段落再聚类 + 命名） ----------
+
+const CHAPTERS_SYSTEM: &str = r#"你是内容分章助手。输入是播客的段落列表，每行格式：p段落号 [mm:ss] 该段首句。
+任务：按话题把连续段落聚成章节（每章约 3-8 分钟，话题转换处切分）。
+输出最简 JSON：{"c": [{"p": 起始段落号, "t": "章节标题（10 字内中文）", "b": "一句话概要（25 字内）"}]}
+第一章必须从 p0 开始。不要输出任何原文或解释。"#;
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct SentRow {
+    para_idx: i64,
+    start_secs: f64,
+    end_secs: f64,
+    text_en: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChapterCut {
+    pub p: i64,
+    pub t: String,
+    pub b: Option<String>,
+}
+
+/// LLM 断点 → 章节时间区间（纯函数便于测试）。
+/// paras 按 para_idx 有序；返回 (idx, start, end, title, summary)。
+fn assemble_chapters(
+    paras: &[(i64, f64)],
+    last_end: f64,
+    cuts: &[ChapterCut],
+) -> Vec<(usize, f64, f64, String, Option<String>)> {
+    if paras.is_empty() {
+        return vec![];
+    }
+    let para_start = |p: i64| paras.iter().find(|(pp, _)| *pp == p).map(|x| x.1);
+    let mut bounds: Vec<&ChapterCut> = cuts.iter().filter(|c| para_start(c.p).is_some()).collect();
+    bounds.sort_by_key(|c| c.p);
+    bounds.dedup_by_key(|c| c.p);
+    let first_para = paras[0].0;
+    let mut owned;
+    let bounds: Vec<ChapterCut> = if bounds.first().map(|b| b.p) != Some(first_para) {
+        owned = vec![ChapterCut {
+            p: first_para,
+            t: "开场".into(),
+            b: None,
+        }];
+        owned.extend(bounds.into_iter().cloned());
+        owned
+    } else {
+        bounds.into_iter().cloned().collect()
+    };
+    bounds
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let start = para_start(c.p).unwrap();
+            let end = bounds
+                .get(i + 1)
+                .and_then(|n| para_start(n.p))
+                .unwrap_or(last_end);
+            let title = {
+                let t = c.t.trim();
+                if t.is_empty() { format!("章节 {}", i + 1) } else { t.to_string() }
+            };
+            (i, start, end, title, c.b.clone())
+        })
+        .collect()
+}
+
+/// 解析 LLM 返回的章节 JSON，容错截取最外层 {}
+fn parse_chapter_cuts(out: &str) -> Vec<ChapterCut> {
+    let json_text = out
+        .find('{')
+        .and_then(|s| out.rfind('}').map(|e| &out[s..=e]))
+        .unwrap_or(out);
+    serde_json::from_str::<serde_json::Value>(json_text)
+        .ok()
+        .and_then(|v| v.get("c")?.as_array().cloned())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let p = c.get("p")?.as_i64()?;
+                    let t = c.get("t")?.as_str()?.to_string();
+                    let b = c.get("b").and_then(|b| b.as_str()).map(|s| s.to_string());
+                    Some(ChapterCut { p, t, b })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+pub async fn generate_chapters(
+    pool: tauri::State<'_, SqlitePool>,
+    video_id: i64,
+) -> Result<usize, String> {
+    let sents = sqlx::query_as::<_, SentRow>(
+        "SELECT para_idx, start_secs, end_secs, text_en FROM sentences WHERE video_id = ? ORDER BY para_idx, sent_idx",
+    )
+    .bind(video_id)
+    .fetch_all(pool.inner())
+    .await
+    .map_err(|e| e.to_string())?;
+    if sents.is_empty() {
+        return Err("需先整理精校再生成章节".into());
+    }
+
+    // 段落首句 + 段首时间（章节 = 段落的再聚类，输入量比逐句小一个数量级）
+    let mut paras: Vec<(i64, f64, String)> = Vec::new();
+    for s in &sents {
+        if paras.last().map(|l| l.0) != Some(s.para_idx) {
+            paras.push((s.para_idx, s.start_secs, s.text_en.clone()));
+        }
+    }
+    let last_end = sents.last().map(|s| s.end_secs).unwrap_or(0.0);
+
+    let mut input = String::new();
+    for (p, st, text) in &paras {
+        let mm = (st / 60.0) as u64;
+        let ss = (st % 60.0) as u64;
+        let head: String = text.chars().take(80).collect();
+        let line = format!("p{p} [{mm:02}:{ss:02}] {head}\n");
+        if input.len() + line.len() > 14000 {
+            input.push_str("……(后文略)\n");
+            break;
+        }
+        input.push_str(&line);
+    }
+
+    let cfg = LlmConfig::from_settings(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let out = llm::chat(&cfg, CHAPTERS_SYSTEM, &input, true)
+        .await
+        .map_err(|e| e.to_string())?;
+    let cuts = parse_chapter_cuts(&out);
+    if cuts.is_empty() {
+        return Err("章节生成失败：模型未返回有效结果".into());
+    }
+
+    let para_times: Vec<(i64, f64)> = paras.iter().map(|(p, st, _)| (*p, *st)).collect();
+    let chapters = assemble_chapters(&para_times, last_end, &cuts);
+
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+    sqlx::query("DELETE FROM chapters WHERE video_id = ?")
+        .bind(video_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    for (idx, start, end, title, summary) in &chapters {
+        sqlx::query(
+            "INSERT INTO chapters (video_id, idx, start_secs, end_secs, title, summary) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(video_id)
+        .bind(*idx as i64)
+        .bind(start)
+        .bind(end)
+        .bind(title)
+        .bind(summary)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(chapters.len())
+}
+
+#[tauri::command]
+pub async fn list_chapters(
+    pool: tauri::State<'_, SqlitePool>,
+    video_id: i64,
+) -> Result<Vec<crate::models::Chapter>, String> {
+    sqlx::query_as::<_, crate::models::Chapter>(
+        "SELECT * FROM chapters WHERE video_id = ? ORDER BY idx",
+    )
+    .bind(video_id)
+    .fetch_all(pool.inner())
+    .await
+    .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,6 +924,45 @@ mod tests {
             end_secs: end,
             text_en: text.to_string(),
         }
+    }
+
+    #[test]
+    fn assembles_chapters_from_cuts() {
+        let paras = vec![(0, 0.0), (1, 300.0), (2, 600.0), (3, 900.0)];
+        let cuts = vec![
+            ChapterCut { p: 0, t: "开场白".into(), b: Some("自我介绍".into()) },
+            ChapterCut { p: 2, t: "正题".into(), b: None },
+        ];
+        let out = assemble_chapters(&paras, 1200.0, &cuts);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], (0, 0.0, 600.0, "开场白".to_string(), Some("自我介绍".to_string())));
+        assert_eq!(out[1], (1, 600.0, 1200.0, "正题".to_string(), None));
+    }
+
+    #[test]
+    fn assembles_chapters_handles_messy_cuts() {
+        let paras = vec![(0, 0.0), (1, 100.0), (2, 200.0)];
+        // 乱序 + 重复 + 越界段落号 + 缺首段 + 空标题
+        let cuts = vec![
+            ChapterCut { p: 2, t: "".into(), b: None },
+            ChapterCut { p: 99, t: "无效".into(), b: None },
+            ChapterCut { p: 2, t: "重复".into(), b: None },
+        ];
+        let out = assemble_chapters(&paras, 300.0, &cuts);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].1, 0.0);
+        assert_eq!(out[0].3, "开场");
+        assert_eq!(out[1], (1, 200.0, 300.0, "章节 2".to_string(), None));
+    }
+
+    #[test]
+    fn parses_chapter_cuts_tolerantly() {
+        let cuts = parse_chapter_cuts("前缀{\"c\": [{\"p\": 0, \"t\": \"开场\", \"b\": \"概要\"}, {\"p\": 3, \"t\": \"进阶\"}]}后缀");
+        assert_eq!(cuts.len(), 2);
+        assert_eq!(cuts[0].p, 0);
+        assert_eq!(cuts[0].b.as_deref(), Some("概要"));
+        assert_eq!(cuts[1].b, None);
+        assert!(parse_chapter_cuts("not json").is_empty());
     }
 
     #[test]

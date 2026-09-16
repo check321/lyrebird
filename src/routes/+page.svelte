@@ -1,6 +1,8 @@
 <script lang="ts">
   import { invoke, convertFileSrc } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
+  import { goto } from "$app/navigation";
+  import { linkKind, normalizeChannelUrl, fmtCount } from "$lib/youtube";
   import { onMount } from "svelte";
 
   type Video = {
@@ -8,6 +10,7 @@
     url: string;
     title: string | null;
     duration_secs: number | null;
+    video_path: string | null;
     subtitle_source: string | null;
     tldr: string | null;
     created_at: string;
@@ -16,8 +19,18 @@
     thumbnail_path: string | null;
     category: string;
   };
+  type Subscription = {
+    id: number;
+    channel_id: string;
+    title: string;
+    url: string;
+    avatar: string | null;
+    follower_count: number | null;
+    created_at: string;
+  };
 
   let videos = $state<Video[]>([]);
+  let subscriptions = $state<Subscription[]>([]);
   let url = $state("");
   let importing = $state(false);
   let progress = $state<{
@@ -25,6 +38,8 @@
     total_steps: number;
     label: string;
     percent: number | null;
+    speed: string | null;
+    detail: string | null;
   } | null>(null);
   let error = $state("");
 
@@ -70,11 +85,36 @@
   async function importVideo(event: Event) {
     event.preventDefault();
     error = "";
+    const kind = linkKind(url);
+    if (kind === "channel") {
+      goto(`/channel?url=${encodeURIComponent(normalizeChannelUrl(url))}`);
+      return;
+    }
+    if (kind !== "video") {
+      error = "无法识别的链接：支持 YouTube 视频链接（watch/shorts）或频道链接（@handle）";
+      return;
+    }
     importing = true;
-    progress = { step: 0, total_steps: 4, label: "准备中…", percent: null };
+    progress = { step: 0, total_steps: 4, label: "准备中…", percent: null, speed: null, detail: null };
     try {
       await invoke("import_video", { url });
       url = "";
+      await refresh();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      importing = false;
+      progress = null;
+    }
+  }
+
+  /** 重新导入下载中断的视频（后端复用记录与 .part 文件断点续传） */
+  async function retryImport(v: Video) {
+    error = "";
+    importing = true;
+    progress = { step: 0, total_steps: 4, label: "准备中…", percent: null, speed: null, detail: null };
+    try {
+      await invoke("import_video", { url: v.url });
       await refresh();
     } catch (e) {
       error = String(e);
@@ -107,6 +147,12 @@
     videos = videos.filter((x) => x.id !== v.id);
   }
 
+  async function unsubscribe(s: Subscription) {
+    if (!confirm(`取消订阅「${s.title}」？`)) return;
+    await invoke("unsubscribe_channel", { channelId: s.channel_id });
+    subscriptions = subscriptions.filter((x) => x.channel_id !== s.channel_id);
+  }
+
   async function saveRename(oldName: string) {
     const name = newCatName.trim();
     if (!name || name === oldName) {
@@ -131,11 +177,16 @@
 
   onMount(() => {
     refresh();
+    invoke<Subscription[]>("list_subscriptions")
+      .then((s) => (subscriptions = s))
+      .catch((e) => (error = `加载订阅频道失败: ${e}`));
     const unlisten = listen<{
       step: number;
       total_steps: number;
       label: string;
       percent: number | null;
+      speed: string | null;
+      detail: string | null;
     }>("import-progress", (e) => {
       progress = e.payload;
     });
@@ -151,7 +202,7 @@
   <form class="mb-4 flex gap-2" onsubmit={importVideo}>
     <input
       bind:value={url}
-      placeholder="粘贴 YouTube 播客链接…"
+      placeholder="粘贴 YouTube 视频或频道链接（@handle）…"
       class="flex-1 rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
     />
     <button
@@ -161,6 +212,56 @@
       >{importing ? "导入中…" : "导入"}</button
     >
   </form>
+
+  {#if subscriptions.length > 0}
+    <section class="mb-6">
+      <div class="mb-3 flex items-center gap-2">
+        <h3 class="text-sm font-semibold text-zinc-700">订阅频道</h3>
+        <span class="text-xs text-zinc-400">{subscriptions.length} 个频道</span>
+      </div>
+      <div class="flex gap-3 overflow-x-auto pb-1">
+        {#each subscriptions as s (s.channel_id)}
+          <div
+            class="group relative w-40 shrink-0 rounded-xl border border-zinc-200 bg-white p-4 shadow-sm transition-shadow hover:shadow-md"
+          >
+            <a
+              href="/channel?url={encodeURIComponent(s.url)}"
+              class="flex flex-col items-center gap-2 text-center"
+              title={s.title}
+            >
+              {#if s.avatar}
+                <img
+                  src={s.avatar}
+                  alt=""
+                  class="h-14 w-14 rounded-full object-cover"
+                />
+              {:else}
+                <span
+                  class="flex h-14 w-14 items-center justify-center rounded-full bg-indigo-100 text-lg font-semibold text-indigo-600"
+                >
+                  {s.title.slice(0, 1)}
+                </span>
+              {/if}
+              <span class="w-full truncate text-sm font-medium text-zinc-800">
+                {s.title}
+              </span>
+              {#if s.follower_count != null}
+                <span class="text-xs text-zinc-400">{fmtCount(s.follower_count)} 订阅</span>
+              {/if}
+            </a>
+            <button
+              onclick={() => unsubscribe(s)}
+              class="absolute top-1.5 right-1.5 rounded-md p-1 text-zinc-300 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-red-50 hover:text-red-500"
+              title="取消订阅"
+              aria-label="取消订阅"
+            >
+              <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18" /><path d="m6 6 12 12" /></svg>
+            </button>
+          </div>
+        {/each}
+      </div>
+    </section>
+  {/if}
 
   {#if progress}
     <div class="mb-4 rounded-lg border border-zinc-200 bg-white p-4 shadow-sm">
@@ -198,8 +299,13 @@
                   : "text-zinc-300"}
             >
               {active ? progress.label : label}
-              {#if active && progress.percent != null}
+              {#if active && progress.detail}
+                <span class="font-mono text-zinc-400"> {progress.detail}</span>
+              {:else if active && progress.percent != null}
                 <span class="text-zinc-400"> {progress.percent.toFixed(1)}%</span>
+              {/if}
+              {#if active && progress.speed}
+                <span class="font-mono text-zinc-400"> {progress.speed}</span>
               {/if}
             </span>
           </li>
@@ -255,29 +361,52 @@
               <li
                 class="flex gap-4 rounded-xl border border-zinc-200 bg-white p-3 shadow-sm"
               >
-                <a href="/player/{v.id}" class="block shrink-0">
-                  {#if v.thumbnail_path}
-                    <img
-                      src={convertFileSrc(v.thumbnail_path)}
-                      alt=""
-                      class="h-20 w-36 rounded-lg object-cover"
-                    />
-                  {:else}
-                    <div
-                      class="flex h-20 w-36 items-center justify-center rounded-lg bg-zinc-100 text-xs text-zinc-400"
-                    >
-                      无封面
-                    </div>
-                  {/if}
-                </a>
+                {#if v.video_path}
+                  <a href="/player/{v.id}" class="block shrink-0">
+                    {#if v.thumbnail_path}
+                      <img
+                        src={convertFileSrc(v.thumbnail_path)}
+                        alt=""
+                        class="h-20 w-36 rounded-lg object-cover"
+                      />
+                    {:else}
+                      <div
+                        class="flex h-20 w-36 items-center justify-center rounded-lg bg-zinc-100 text-xs text-zinc-400"
+                      >
+                        无封面
+                      </div>
+                    {/if}
+                  </a>
+                {:else if v.thumbnail_path}
+                  <img
+                    src={convertFileSrc(v.thumbnail_path)}
+                    alt=""
+                    class="h-20 w-36 shrink-0 rounded-lg object-cover opacity-50"
+                  />
+                {:else}
+                  <div
+                    class="flex h-20 w-36 shrink-0 items-center justify-center rounded-lg bg-zinc-100 text-xs text-zinc-400"
+                  >
+                    未下载
+                  </div>
+                {/if}
 
                 <div class="min-w-0 flex-1">
-                  <a
-                    href="/player/{v.id}"
-                    class="block truncate text-sm font-semibold text-zinc-900 hover:text-indigo-600"
-                    title={v.title ?? v.url}
-                    >{v.title ?? v.url}</a
-                  >
+                  {#if v.video_path}
+                    <a
+                      href="/player/{v.id}"
+                      class="block truncate text-sm font-semibold text-zinc-900 hover:text-indigo-600"
+                      title={v.title ?? v.url}
+                      >{v.title ?? v.url}</a
+                    >
+                  {:else}
+                    <p
+                      class="block truncate text-sm font-semibold text-zinc-900"
+                      title={v.title ?? v.url}
+                    >
+                      {v.title ?? v.url}
+                    </p>
+                  {/if}
                   {#if v.description}
                     <p
                       class="mt-1 line-clamp-2 text-xs leading-relaxed text-zinc-500"
@@ -294,28 +423,49 @@
                         >{fmtDuration(v.duration_secs)}</span
                       >
                     {/if}
-                    <span
-                      class="rounded px-1.5 py-0.5 text-[11px] {v.subtitle_source ===
-                      'asr'
-                        ? 'bg-amber-50 text-amber-600'
-                        : 'bg-green-50 text-green-600'}"
-                      >{v.subtitle_source === "asr" ? "ASR 字幕" : "CC 字幕"}</span
-                    >
+                    {#if v.video_path}
+                      <span
+                        class="rounded px-1.5 py-0.5 text-[11px] {v.subtitle_source ===
+                        'asr'
+                          ? 'bg-amber-50 text-amber-600'
+                          : 'bg-green-50 text-green-600'}"
+                        >{v.subtitle_source === "asr" ? "ASR 字幕" : "CC 字幕"}</span
+                      >
+                    {:else}
+                      <span
+                        class="rounded bg-amber-50 px-1.5 py-0.5 text-[11px] font-medium text-amber-600"
+                        >下载中断</span
+                      >
+                    {/if}
                     <span class="ml-auto text-zinc-300">{v.created_at}</span>
                   </div>
                 </div>
 
                 <div class="flex shrink-0 flex-col justify-center gap-2">
-                  <button
-                    onclick={() => openEdit(v)}
-                    class="rounded-md p-1.5 text-zinc-400 hover:bg-zinc-100 hover:text-indigo-600"
-                    title="编辑"
-                    aria-label="编辑"
-                  >
-                    <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
-                    </svg>
-                  </button>
+                  {#if v.video_path}
+                    <button
+                      onclick={() => openEdit(v)}
+                      class="rounded-md p-1.5 text-zinc-400 hover:bg-zinc-100 hover:text-indigo-600"
+                      title="编辑"
+                      aria-label="编辑"
+                    >
+                      <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+                      </svg>
+                    </button>
+                  {:else}
+                    <button
+                      onclick={() => retryImport(v)}
+                      disabled={importing}
+                      class="rounded-md p-1.5 text-zinc-400 hover:bg-indigo-50 hover:text-indigo-600 disabled:opacity-50"
+                      title="断点续传"
+                      aria-label="断点续传"
+                    >
+                      <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8" /><path d="M21 3v5h-5" />
+                      </svg>
+                    </button>
+                  {/if}
                   <button
                     onclick={() => removeVideo(v)}
                     class="rounded-md p-1.5 text-zinc-400 hover:bg-red-50 hover:text-red-500"

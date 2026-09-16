@@ -88,6 +88,22 @@ mod tests {
         assert!(contains_word("Yeah, the scop cance canceled.", "canceled"));
         assert!(!contains_word("Yeah, the scop cance canceled.", "cancel"));
     }
+
+    #[test]
+    fn finds_sentence_containing_phrase_via_substring_fallback() {
+        // 短语无法整词匹配，extract_context 依赖子串兜底命中所在句
+        let text = "Maybe to turn the as if it's going to spiral out of control is the impression. They're trying to give.";
+        let sentences = split_sentences(text);
+        let word_lower = "out of control".to_string();
+        let found = sentences
+            .iter()
+            .find(|s| contains_word(s, &word_lower))
+            .or_else(|| sentences.iter().find(|s| s.to_lowercase().contains(&word_lower)));
+        assert_eq!(
+            found.unwrap(),
+            "Maybe to turn the as if it's going to spiral out of control is the impression."
+        );
+    }
 }
 
 async fn dict_path(pool: &SqlitePool) -> Result<String, String> {
@@ -175,8 +191,14 @@ pub async fn analyze_word(
             .unwrap_or(context),
         _ => context,
     };
-    let system = "你是英语词汇老师。用户给你一个单词和它在播客字幕中的原句，请用中文简明解析：\n1. 该词在此句中的具体含义和词性；\n2. 常见搭配或用法（如有）；\n3. 如有熟词僻义请特别指出。\n控制在 120 字以内，直接输出解析文本。";
-    let user = format!("单词：{word}\n原句：{context}");
+    let is_phrase = word.contains(' ');
+    let system = if is_phrase {
+        "你是英语老师。用户给你一个英语短语/习语和它在播客字幕中的原句，请用中文简明解析：\n1. 该短语在此句中的整体含义；\n2. 语域与典型用法（如口语/书面/正式）；\n3. 可替换的近义表达（如有）。\n控制在 120 字以内，直接输出解析文本。"
+    } else {
+        "你是英语词汇老师。用户给你一个单词和它在播客字幕中的原句，请用中文简明解析：\n1. 该词在此句中的具体含义和词性；\n2. 常见搭配或用法（如有）；\n3. 如有熟词僻义请特别指出。\n控制在 120 字以内，直接输出解析文本。"
+    };
+    let label = if is_phrase { "短语" } else { "单词" };
+    let user = format!("{label}：{word}\n原句：{context}");
     llm::chat(&cfg, system, &user, false)
         .await
         .map_err(|e| e.to_string())
